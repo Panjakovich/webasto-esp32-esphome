@@ -1,0 +1,20 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Python / ESPHome artifacts
+__pycache__/
+*.pyc
+.esphome/
+build/
+
+# Secrets (держите их только локально)
+secrets.yaml
+
