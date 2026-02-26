@@ -85,6 +85,12 @@ globals:
   - id: low_power_start_time
     type: uint32
     initial_value: '0'
+  - id: last_room_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_room_temp_time
+    type: uint32
+    initial_value: '0'
 
 # --- Выходы ---
 output:
@@ -255,6 +261,20 @@ sensor:
       }
       return id(flow_temp).state - id(return_temp).state;
 
+  # Температура в комнате (из Home Assistant)
+  - platform: homeassistant
+    id: room_temp
+    entity_id: sensor.room_temperature_living   # ЗАМЕНИТЬ на реальное имя из HA
+    internal: false
+    name: "Room Temperature"
+
+  # Уличная температура (из Home Assistant)
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: sensor.outdoor_temperature      # ЗАМЕНИТЬ на реальное имя из HA
+    internal: false
+    name: "Outdoor Temperature"
+
   # Текущая скорость вентилятора (в %)
   - platform: template
     name: "Current Fan Speed"
@@ -383,70 +403,165 @@ interval:
           float r = id(return_temp).state;
           float d = id(delta_t).state;
 
-          // Управление байпасом и мощностью только когда Webasto реально работает
+          float room = id(room_temp).state;
+          float room_target = id(room_target_temp).state;
+
+          float rad_target = id(radiator_target_temp).state;
+          float rad_low_margin = id(radiator_low_margin).state;
+          float rad_high_margin = id(radiator_high_margin).state;
+
+          float dt_low = id(delta_t_low).state;
+          float dt_high = id(delta_t_high).state;
+
+          float dt_bypass_open = id(bypass_open_dt).state;
+          float dt_bypass_close = id(bypass_close_dt).state;
+
+          float outdoor = id(outdoor_temp).state;
+
+          // Управление имеет смысл только при работе котла
           if (id(heater_state) == 1 || id(heater_state) == 2) {
-            // На преднагреве и розжиге держим байпас открытым — маленький контур,
-            // Webasto быстрее выходит на рабочую температуру.
+            // Преднагрев/розжиг: байпас открыт, малый контур
             id(bypass_valve).turn_on();
-          } else if (id(heater_state) == 3) {
-            // RUNNING: логика по нагрузке и температуре радиаторов
-            if (std::isnan(f) || std::isnan(r) || std::isnan(d)) {
-              ESP_LOGW("auto_power", "Flow/return/delta_t NAN, skip auto control.");
+            return;
+          }
+
+          if (id(heater_state) != 3) {
+            // Не рабочий режим -> байпас закрыт
+            id(bypass_valve).turn_off();
+            return;
+          }
+
+          // Проверки на NAN
+          if (std::isnan(f) || std::isnan(r) || std::isnan(d) || std::isnan(room) || std::isnan(room_target)) {
+            ESP_LOGW("auto_power", "Some sensors NAN, skip auto control.");
+            return;
+          }
+
+          // --- 1. Ошибка по комнате и тренд (тепловая инерция) ---
+          float room_error = room_target - room;  // >0 => надо греть
+
+          uint32_t now = millis();
+          float room_trend = 0.0f;  // °C/час
+
+          if (id(last_room_temp_time) != 0 && !std::isnan(id(last_room_temp))) {
+            float dt_ms = (float)(now - id(last_room_temp_time));
+            if (dt_ms > 1.0f) {
+              room_trend = (room - id(last_room_temp)) * 3600000.0f / dt_ms;
+            }
+          }
+          id(last_room_temp) = room;
+          id(last_room_temp_time) = now;
+
+          // --- 2. Погодозависимая поправка ---
+          float cold_bias = 0.0f;
+          if (!std::isnan(outdoor)) {
+            if (outdoor < -10.0f) {
+              cold_bias = 1.0f;
+            } else if (outdoor < 0.0f) {
+              cold_bias = 0.5f;
+            } else if (outdoor > 10.0f) {
+              cold_bias = -0.5f;
+            }
+          }
+
+          std::string cur_mode = id(target_power_select).state;
+          std::string new_mode = cur_mode;
+
+          // --- 3. Базовая логика по радиаторной подаче и ΔT (5 ступеней) ---
+          float rad_low = rad_target - rad_low_margin;
+          float rad_high = rad_target + rad_high_margin;
+
+          // Высокая нагрузка -> High/Turbo
+          if (f < rad_low - 5.0f || d > dt_high + 2.0f) {
+            new_mode = "Turbo";
+          } else if (f < rad_low || d > dt_high) {
+            new_mode = "High";
+          }
+          // Средняя нагрузка -> Medium
+          else if (f >= rad_low && f <= rad_high && d >= dt_low && d <= dt_high) {
+            new_mode = "Medium";
+          }
+          // Малая нагрузка -> Low / Very Low
+          else if (f > rad_high && d < dt_low) {
+            if (f > rad_high + 5.0f) {
+              new_mode = "Very Low";
             } else {
-              std::string cur_mode = id(target_power_select).state;
-              std::string new_mode = cur_mode;
-
-              // 1. Цель: радиаторная подача около 50°C
-              //   - если f < 45°C или d > 8°C -> много тепла забирают -> High
-              if (f < ${radiator_low_c} || d > 8.0f) {
-                new_mode = "High";
-              }
-              //   - если 45–55°C и ΔT средний -> Medium
-              else if (f >= ${radiator_low_c} && f <= ${radiator_high_c} && d >= 3.0f && d <= 8.0f) {
-                new_mode = "Medium";
-              }
-              //   - если f > 55°C и ΔT маленький -> Low (малая нагрузка, не перегревать контур)
-              else if (f > ${radiator_high_c} && d < 3.0f) {
-                new_mode = "Low";
-              }
-              else {
-                // По умолчанию стремимся к Medium
-                new_mode = "Medium";
-              }
-
-              // 2. Защита от сажи: не сидим в Low бесконечно
-              if (cur_mode == "Low") {
-                uint32_t now = millis();
-                if (now - id(low_power_start_time) > 15UL * 60UL * 1000UL) {
-                  ESP_LOGI("auto_power", "Long Low power -> bump to Medium for soot prevention");
-                  new_mode = "Medium";
-                  id(low_power_start_time) = now;
-                }
-              }
-
-              // 3. Применяем новый режим, если он изменился
-              if (new_mode != cur_mode) {
-                ESP_LOGI("auto_power", "Auto power: %s -> %s (flow=%.1f, return=%.1f, dT=%.1f)",
-                         cur_mode.c_str(), new_mode.c_str(), f, r, d);
-                id(target_power_select).publish_state(new_mode);
-              }
-
-              // 4. Управление байпасом в RUNNING:
-              //   - если нагрузка мала (d < 3) и f < 60°C -> держим байпас открыт, чтобы
-              //     часть потока шла в короткий контур и Webasto не остывала слишком
-              if (d < 3.0f && f < 60.0f) {
-                id(bypass_valve).turn_on();
-              }
-              //   - если нагрузка большая (d > 5 или f > 65°C) -> закрываем байпас,
-              //     гоним тепло в основной контур
-              else if (d > 5.0f || f > 65.0f) {
-                id(bypass_valve).turn_off();
-              }
-              //   - иначе оставляем текущее состояние
+              new_mode = "Low";
             }
           } else {
-            // Webasto не в работе -> байпас закрыт
+            new_mode = "Low";
+          }
+
+          // --- 4. Коррекция по комнате и тренду ---
+          if (room_error > 1.5f || room_trend < -0.5f) {
+            // Холодно или остывает -> поднимаем ступень
+            if (new_mode == "Very Low") new_mode = "Low";
+            else if (new_mode == "Low") new_mode = "Medium";
+            else if (new_mode == "Medium") {
+              new_mode = (cold_bias > 0.5f) ? "High" : "Medium";
+            } else if (new_mode == "High" && cold_bias > 0.5f) {
+              new_mode = "Turbo";
+            }
+          } else if (room_error < 0.5f && room_trend > 0.2f) {
+            // Почти догрели и продолжаем нагреваться -> экономим, опуская ступень
+            if (new_mode == "Turbo") new_mode = "High";
+            else if (new_mode == "High") new_mode = "Medium";
+            else if (new_mode == "Medium") new_mode = "Low";
+            else if (new_mode == "Low") new_mode = "Very Low";
+          }
+
+          // Погодозависимый общий сдвиг (тонкая коррекция)
+          if (cold_bias > 0.5f) {
+            if (new_mode == "Low") new_mode = "Medium";
+            else if (new_mode == "Medium") new_mode = "High";
+          } else if (cold_bias < -0.4f) {
+            if (new_mode == "High") new_mode = "Medium";
+            else if (new_mode == "Medium") new_mode = "Low";
+          }
+
+          // --- 5. Защита от сажи: долгое Low/Very Low -> прожиг ---
+          if (cur_mode == "Low" || cur_mode == "Very Low") {
+            uint32_t now2 = millis();
+            if (now2 - id(low_power_start_time) > 15UL * 60UL * 1000UL) {
+              ESP_LOGI("auto_power", "Long Low power -> bump to Medium for soot prevention");
+              new_mode = "Medium";
+              id(low_power_start_time) = now2;
+            }
+          }
+
+          // --- 6. Применяем новый режим, если он изменился ---
+          if (new_mode != cur_mode) {
+            ESP_LOGI("auto_power", "Auto power: %s -> %s (room=%.1f/%.1f, flow=%.1f, return=%.1f, dT=%.1f, trend=%.2fC/h, outdoor=%.1f)",
+                     cur_mode.c_str(), new_mode.c_str(), room, room_target, f, r, d, room_trend, outdoor);
+            id(target_power_select).publish_state(new_mode);
+          }
+
+          // --- 7. Управление байпасом в RUNNING с учётом ΔT и подачи ---
+          if (d < dt_bypass_open && f < rad_target + 5.0f) {
+            id(bypass_valve).turn_on();
+          } else if (d > dt_bypass_close || f > rad_target + 10.0f) {
             id(bypass_valve).turn_off();
+          }
+
+          // --- 8. Переход в режим idle вместо выключения свитча ---
+          // Условия: комната чуть выше цели, тренд не падает, нагрузка по воде маленькая
+          if (room_error < -0.5f && room_trend >= -0.1f && d < dt_low && f > rad_low) {
+            if (id(heater_state) == 3) {
+              ESP_LOGI("auto_power", "Room warm and stable -> going to IDLE (cooldown sequence)");
+              // Запускаем штатный цикл остановки, но не трогаем мастер‑свитч
+              id(heater_state) = 4;
+              id(glow_plug_pwm).set_level(0.0f);
+              id(fan_pwm).set_level(1.0f);
+              // Дальше скрипт stop_sequence доведёт до полного останова
+              id(stop_sequence).execute();
+            }
+          }
+
+          // --- 9. Авто‑запуск из idle при недогреве комнаты ---
+          // Если свитч включен, котёл в состоянии "выключен", а в комнате холоднее цели на 2°C+
+          if (id(heater_switch).state && id(heater_state) == 0 && room_error > 2.0f) {
+            ESP_LOGI("auto_power", "Room below target-2 -> auto start from IDLE");
+            id(start_sequence).execute();
           }
 
 # --- Скрипты управления ---
@@ -587,22 +702,30 @@ select:
   - platform: template
     name: "Target Power"
     id: target_power_select
-    options: ["Low", "Medium", "High"]
-    initial_option: "Medium"
+    options: ["Very Low", "Low", "Medium", "High", "Turbo"]
+    initial_option: "Low"
     optimistic: true
     on_value:
       then:
         - lambda: |-
-            if (x == "Low") {
-              id(fuel_freq) = 1.2f;
+            // 5 уровней мощности котла
+            if (x == "Very Low") {
+              id(fuel_freq) = 0.8f;
+              id(fan_speed) = 0.2f;
+              id(low_power_start_time) = millis();
+            } else if (x == "Low") {
+              id(fuel_freq) = 1.4f;
               id(fan_speed) = 0.3f;
               id(low_power_start_time) = millis();
             } else if (x == "Medium") {
               id(fuel_freq) = 2.8f;
               id(fan_speed) = 0.5f;
             } else if (x == "High") {
-              id(fuel_freq) = 5.0f;
-              id(fan_speed) = 0.9f;
+              id(fuel_freq) = 4.0f;
+              id(fan_speed) = 0.75f;
+            } else if (x == "Turbo") {
+              id(fuel_freq) = 5.5f;
+              id(fan_speed) = 1.0f;
             }
 
             // Вентилятор
@@ -612,11 +735,93 @@ select:
 
             // PWM помпы в зависимости от мощности
             float pump_level = 1.0f;
-            if (x == "Low") {
-              pump_level = 0.6f;
+            if (x == "Very Low") {
+              pump_level = 0.5f;
+            } else if (x == "Low") {
+              pump_level = 0.65f;
             } else if (x == "Medium") {
               pump_level = 0.8f;
-            } else { // High
+            } else if (x == "High") {
+              pump_level = 0.9f;
+            } else { // Turbo
               pump_level = 1.0f;
             }
             id(coolant_pump_pwm).set_level(pump_level);
+
+number:
+  # Целевая температура воздуха в комнате
+  - platform: template
+    id: room_target_temp
+    name: "Room Target Temperature"
+    min_value: 16
+    max_value: 26
+    step: 0.5
+    optimistic: true
+    initial_value: 22
+
+  # Целевая температура подачи радиаторов
+  - platform: template
+    id: radiator_target_temp
+    name: "Radiator Target Temperature"
+    min_value: 35
+    max_value: 70
+    step: 1
+    optimistic: true
+    initial_value: 50
+
+  # Нижняя/верхняя границы комфортной подачи (около target)
+  - platform: template
+    id: radiator_low_margin
+    name: "Radiator Low Margin"
+    min_value: 2
+    max_value: 15
+    step: 0.5
+    optimistic: true
+    initial_value: 5
+
+  - platform: template
+    id: radiator_high_margin
+    name: "Radiator High Margin"
+    min_value: 2
+    max_value: 15
+    step: 0.5
+    optimistic: true
+    initial_value: 5
+
+  # Порог ΔT для Low / Medium / High
+  - platform: template
+    id: delta_t_low
+    name: "Delta T Low Threshold"
+    min_value: 1
+    max_value: 10
+    step: 0.5
+    optimistic: true
+    initial_value: 3
+
+  - platform: template
+    id: delta_t_high
+    name: "Delta T High Threshold"
+    min_value: 3
+    max_value: 20
+    step: 0.5
+    optimistic: true
+    initial_value: 8
+
+  # Пороги ΔT для управления байпасом
+  - platform: template
+    id: bypass_open_dt
+    name: "Bypass Open Delta T"
+    min_value: 0.5
+    max_value: 10
+    step: 0.5
+    optimistic: true
+    initial_value: 3
+
+  - platform: template
+    id: bypass_close_dt
+    name: "Bypass Close Delta T"
+    min_value: 1
+    max_value: 15
+    step: 0.5
+    optimistic: true
+    initial_value: 5
